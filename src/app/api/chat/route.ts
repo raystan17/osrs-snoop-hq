@@ -7,6 +7,9 @@ import {
 } from "@/lib/data";
 import { GroundingMeta, researchQuestion } from "@/lib/osrs-research";
 
+export const maxDuration = 60;
+export const runtime = "nodejs";
+
 type ChatMessage = {
   role: "user" | "assistant";
   content: string;
@@ -20,7 +23,25 @@ type ChatRequest = {
   liveData?: unknown;
 };
 
-function groundedFallback(body: ChatRequest, grounding: GroundingMeta) {
+type ModelFailureReason =
+  | "missing-key"
+  | "http-error"
+  | "timeout"
+  | "empty-output"
+  | "incomplete"
+  | "unknown";
+
+type ModelResult = {
+  reply: string | null;
+  failureReason?: ModelFailureReason;
+  status?: number;
+};
+
+function groundedFallback(
+  body: ChatRequest,
+  grounding: GroundingMeta,
+  failureReason?: ModelFailureReason,
+) {
   const profile = accounts[body.account];
   const text = body.message.toLowerCase();
   const accountMemories = [...initialMemories, ...(body.memories ?? [])].filter(
@@ -68,8 +89,20 @@ function groundedFallback(body: ChatRequest, grounding: GroundingMeta) {
     return `${profile.username} is a ${profile.accountType} at ${profile.totalLevel} total in the verified starting snapshot, with ${profile.collections} collection slots and ${profile.combatTasks} completed Combat Achievements. What stands out is not only the totals, but the route behind them: ${profile.tagline.toLowerCase()} I’ll use live RuneProfile data when available and label anything that comes from an older snapshot.`;
   }
 
+  if (failureReason === "missing-key") {
+    return `I gathered current RuneProfile and OSRS Wiki context for ${profile.username}, but the OpenAI API key is not available on this server. Add OPENAI_API_KEY in Vercel Environment Variables, redeploy, and ask again. I will keep ${profile.accountType} restrictions locked in automatically.`;
+  }
+
+  if (failureReason === "timeout" || failureReason === "incomplete") {
+    return `I gathered current RuneProfile and OSRS Wiki context for ${profile.username}, but the researched answer took too long to finish. Try the same question once more, or ask a slightly narrower version. I still have ${profile.accountType} locked in.`;
+  }
+
+  if (failureReason === "http-error") {
+    return `I gathered current RuneProfile and OSRS Wiki context for ${profile.username}, but OpenAI rejected the researched request. Confirm billing, model access for gpt-5.6-sol, and that OPENAI_MODEL / OPENAI_REASONING_EFFORT are set correctly, then try again.`;
+  }
+
   if (grounding.researched) {
-    return `I gathered current RuneProfile and OSRS Wiki context for ${profile.username}, but the reasoning model is not enabled yet. Add your server-side OpenAI API key and ask this again for a fully researched recommendation. I will keep ${profile.accountType} restrictions locked in automatically.`;
+    return `I gathered current RuneProfile and OSRS Wiki context for ${profile.username}, but the researched answer did not finish cleanly. Ask once more and I will keep ${profile.accountType} restrictions locked in automatically.`;
   }
 
   const memoryCue = accountMemories[0]?.text;
@@ -113,6 +146,7 @@ Rules:
 - The player's enjoyment matters more than maximum efficiency. RuneScape is a happy place.
 - If current inventory, bank, quests, unlocks, or preferences are needed, ask rather than inventing them.
 - Lead with the recommendation. Be warm, direct, conversational, and concise, but include useful quantities and trade-offs.
+- Keep researched answers under about 350 words unless the player asks for more detail.
 - Plain text is preferred. Short headings and bullets are welcome when they improve a detailed answer.
 - Mention the active account naturally when ambiguity could cause a mistake.`;
 }
@@ -127,7 +161,9 @@ function outputText(data: unknown) {
     }>;
   };
 
-  if (typeof response.output_text === "string") return response.output_text;
+  if (typeof response.output_text === "string" && response.output_text.trim()) {
+    return response.output_text.trim();
+  }
 
   const text = (response.output ?? [])
     .flatMap((item) => item.content ?? [])
@@ -138,16 +174,20 @@ function outputText(data: unknown) {
   return text || null;
 }
 
-function reasoningEffort() {
-  const configured = process.env.OPENAI_REASONING_EFFORT;
+function reasoningEffort(preferred?: string) {
+  const configured = preferred ?? process.env.OPENAI_REASONING_EFFORT;
   return ["low", "medium", "high", "xhigh", "max"].includes(configured ?? "")
-    ? configured
-    : "high";
+    ? (configured as string)
+    : "medium";
 }
 
-async function askModel(body: ChatRequest, researchContext: string) {
+async function askModelOnce(
+  body: ChatRequest,
+  researchContext: string,
+  effort: string,
+): Promise<ModelResult> {
   const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) return null;
+  if (!apiKey) return { reply: null, failureReason: "missing-key" };
 
   const history = (body.history ?? [])
     .filter(
@@ -155,7 +195,7 @@ async function askModel(body: ChatRequest, researchContext: string) {
         (message.role === "user" || message.role === "assistant") &&
         typeof message.content === "string",
     )
-    .slice(-24);
+    .slice(-8);
 
   try {
     const response = await fetch("https://api.openai.com/v1/responses", {
@@ -166,8 +206,8 @@ async function askModel(body: ChatRequest, researchContext: string) {
       },
       body: JSON.stringify({
         model: process.env.OPENAI_MODEL || "gpt-5.6-sol",
-        reasoning: { effort: reasoningEffort() },
-        max_output_tokens: 2_400,
+        reasoning: { effort },
+        max_output_tokens: 6_000,
         instructions: buildSystemPrompt(body, researchContext),
         input: [
           ...history.map((message) => ({
@@ -177,14 +217,59 @@ async function askModel(body: ChatRequest, researchContext: string) {
           { role: "user", content: body.message },
         ],
       }),
-      signal: AbortSignal.timeout(90_000),
+      signal: AbortSignal.timeout(50_000),
     });
 
-    if (!response.ok) return null;
-    return outputText(await response.json());
-  } catch {
-    return null;
+    if (!response.ok) {
+      return {
+        reply: null,
+        failureReason: "http-error",
+        status: response.status,
+      };
+    }
+
+    const data = (await response.json()) as {
+      status?: string;
+      incomplete_details?: { reason?: string };
+    };
+    const text = outputText(data);
+
+    if (text) return { reply: text };
+
+    if (data.status === "incomplete") {
+      return { reply: null, failureReason: "incomplete" };
+    }
+
+    return { reply: null, failureReason: "empty-output" };
+  } catch (error) {
+    if (error instanceof Error && error.name === "TimeoutError") {
+      return { reply: null, failureReason: "timeout" };
+    }
+    return { reply: null, failureReason: "unknown" };
   }
+}
+
+async function askModel(
+  body: ChatRequest,
+  researchContext: string,
+  researched: boolean,
+): Promise<ModelResult> {
+  const preferred = reasoningEffort();
+  const first = await askModelOnce(body, researchContext, preferred);
+  if (first.reply) return first;
+
+  if (
+    researched &&
+    (first.failureReason === "timeout" ||
+      first.failureReason === "incomplete" ||
+      first.failureReason === "empty-output")
+  ) {
+    const retry = await askModelOnce(body, researchContext, "medium");
+    if (retry.reply) return retry;
+    return retry.failureReason ? retry : first;
+  }
+
+  return first;
 }
 
 export async function POST(request: Request) {
@@ -192,9 +277,9 @@ export async function POST(request: Request) {
 
   if (
     !body.message?.trim() ||
-    body.account !== "SnoopNoBank" &&
-    body.account !== "SnoopJoint" &&
-    body.account !== "WildySnoop"
+    (body.account !== "SnoopNoBank" &&
+      body.account !== "SnoopJoint" &&
+      body.account !== "WildySnoop")
   ) {
     return NextResponse.json({ error: "Invalid companion request" }, { status: 400 });
   }
@@ -204,14 +289,27 @@ export async function POST(request: Request) {
     body.message.trim(),
     body.liveData,
   );
-  const modelReply = await askModel(body, research.promptContext);
+  const modelResult = await askModel(
+    body,
+    research.promptContext,
+    research.grounding.researched,
+  );
+
   return NextResponse.json({
-    reply: modelReply ?? groundedFallback(body, research.grounding),
-    mode: modelReply
+    reply:
+      modelResult.reply ??
+      groundedFallback(body, research.grounding, modelResult.failureReason),
+    mode: modelResult.reply
       ? research.grounding.researched
         ? "ai-researched"
         : "ai"
       : "grounded-local",
     grounding: research.grounding,
+    diagnostic: modelResult.reply
+      ? undefined
+      : {
+          failureReason: modelResult.failureReason ?? "unknown",
+          status: modelResult.status,
+        },
   });
 }

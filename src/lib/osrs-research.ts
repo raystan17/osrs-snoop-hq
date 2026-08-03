@@ -172,7 +172,7 @@ async function fetchWikiPagesByTitle(titles: string[]) {
     .filter((page) => !page.missing && page.extract && page.fullurl)
     .map((page) => ({
       ...page,
-      extract: truncate(compactWhitespace(page.extract), 28_000),
+      extract: truncate(compactWhitespace(page.extract), 4_500),
     }));
 }
 
@@ -184,7 +184,7 @@ async function searchWiki(query: string) {
       generator: "search",
       gsrsearch: query,
       gsrnamespace: "0",
-      gsrlimit: "4",
+      gsrlimit: "3",
       exintro: "1",
     }),
   );
@@ -194,17 +194,25 @@ async function searchWiki(query: string) {
     .sort((first, second) => (first.index ?? 99) - (second.index ?? 99))
     .map((page) => ({
       ...page,
-      extract: compactWhitespace(page.extract),
+      extract: truncate(compactWhitespace(page.extract), 1_800),
     }));
 }
 
 function guideTitles(account: AccountKey, skill?: string) {
-  if (!skill) return [];
+  if (!skill) {
+    if (account === "WildySnoop") {
+      return ["Obsidian mauler", "Pay-to-play Strength training"];
+    }
+    return [];
+  }
   if (account === "SnoopNoBank") {
     return [`Ultimate Ironman Guide/${skill}`, `Pay-to-play ${skill} training`];
   }
   if (account === "SnoopJoint") {
     return [`Ironman Guide/${skill}`, `Pay-to-play ${skill} training`];
+  }
+  if (skill === "Strength" || skill === "Attack" || skill === "Defence") {
+    return ["Obsidian mauler", `Pay-to-play ${skill} training`];
   }
   return [`Pay-to-play ${skill} training`];
 }
@@ -215,7 +223,7 @@ function buildWikiSearch(account: AccountKey, message: string, skill?: string) {
       ? "Ultimate Ironman"
       : account === "SnoopJoint"
         ? "Ironman"
-        : "1 defence pure obby maul pure";
+        : "1 defence pure obsidian mauler Strength training";
   const cleaned = compactWhitespace(message.replace(/[^\w\s'-]/g, " "));
   return truncate(`${accountQualifier} ${skill ?? ""} ${cleaned}`, 220);
 }
@@ -273,12 +281,9 @@ export async function researchQuestion(
 
   const skills = Array.isArray(skillsResult?.data) ? skillsResult.data : [];
   const quests = Array.isArray(questsResult?.data) ? questsResult.data : [];
-  const wikiPages =
-    account === "WildySnoop"
-      ? dedupeWikiPages([...searchedWiki, ...directWiki]).slice(0, 4)
-      : directWiki.length
-        ? dedupeWikiPages(directWiki).slice(0, 3)
-        : dedupeWikiPages(searchedWiki).slice(0, 4);
+  const wikiPages = directWiki.length
+    ? dedupeWikiPages([...directWiki, ...searchedWiki]).slice(0, 3)
+    : dedupeWikiPages(searchedWiki).slice(0, 3);
   const matchedQuests = relevantQuestStates(quests, message, wikiPages);
   const selectedSkill = skill
     ? skills.find((entry) => entry.name.toLowerCase() === skill.toLowerCase())
@@ -298,6 +303,23 @@ export async function researchQuestion(
       detail: `${selectedSkill.xp.toLocaleString()} current XP; ${targetXp.toLocaleString()} target XP; ${remainingXp.toLocaleString()} XP remaining.`,
     });
   }
+
+  const focusedSkills = selectedSkill
+    ? [selectedSkill]
+    : skills
+        .filter((entry) =>
+          [
+            "Attack",
+            "Strength",
+            "Defence",
+            "Hitpoints",
+            "Prayer",
+            "Ranged",
+            "Magic",
+            "Slayer",
+          ].includes(entry.name),
+        )
+        .slice(0, 8);
 
   const accountSourceAvailable = Boolean(summaryResult || skills.length || quests.length);
   const sources: GroundingSource[] = [
@@ -326,7 +348,7 @@ export async function researchQuestion(
         lockedIdentity: account,
         permanentProfile: accounts[account],
         liveSummary: summaryResult ?? clientLiveData ?? null,
-        liveSkills: skills,
+        liveSkills: focusedSkills.length ? focusedSkills : skills.slice(0, 12),
         relevantQuestStates: matchedQuests,
         questFeedAvailable: quests.length > 0,
       },
